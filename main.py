@@ -196,13 +196,25 @@ sb_unique_clients = int(sb_df["phone"].nunique(dropna=True))
 # =========================
 # ЛІНІЙНИЙ ГРАФІК (вчора, Київ)
 # =========================
-hidx = pd.date_range(start=start_date, end=end_date_exclusive - timedelta(hours=1),
-                     freq="H", tz=KYIV_TZ)
+# 1) Сітка годин 00:00..23:00 (вчора, Київ)
+hidx = pd.date_range(
+    start=start_date,
+    end=end_date_exclusive - timedelta(hours=1),
+    freq="H",
+    tz=KYIV_TZ,
+)
+
+# 2) Приводимо кожну подію до початку години і рахуємо по годинах
+hour_floor = day_df["dt_kyiv"].dt.tz_convert(KYIV_TZ).dt.floor("H")
 events_by_hour = (
-    day_df.set_index("dt_kyiv").sort_index()
-          .resample("H").size()
-).reindex(hidx, fill_value=0)
-hour_labels = hidx.strftime("%H:%M")
+    hour_floor.value_counts()
+    .reindex(hidx, fill_value=0)   # гарантуємо всі години дня
+    .sort_index()
+)
+
+# 3) Підписи осі X
+hour_labels = [d.strftime("%H:%M") for d in hidx]
+
 
 # =========================
 # ДАШБОРД
