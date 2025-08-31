@@ -77,8 +77,15 @@ def now_kyiv():
         return datetime.now(timezone.utc).astimezone(KYIV_TZ)
 
 _now = now_kyiv()
-start_date = _now.replace(hour=0, minute=0, second=0, microsecond=0)
-end_date   = _now.replace(hour=23, minute=59, second=59, microsecond=0)
+report_day = (_now - timedelta(days=1)).date()  # ВЧОРА
+
+start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)   # 00:00
+end_date = start_date + timedelta(days=1)                     # наступний день 00:00
+
+# фильтр:
+mask_day = (df["dt_kyiv"] >= start_date) & (df["dt_kyiv"] < end_date_exclusive)
+day_df = df.loc[mask_day].copy()
+
 
 # =========================
 # ІНФРА
