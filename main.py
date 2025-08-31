@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import requests
-from datetime import datetime, timedelta, timezone, time  # ← добавлен time
+from datetime import datetime, timedelta, timezone, time
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,14 +12,8 @@ from google.oauth2.service_account import Credentials
 # TZ helpers (стабильно для pandas)
 # =========================
 def get_kyiv_tz():
-    """
-    Возвращает tz-объект, который pandas корректно переваривает:
-    1) pytz 'Europe/Kiev' (лучший вариант для pandas),
-    2) zoneinfo 'Europe/Kyiv',
-    3) fixed UTC+03:00 (без DST как крайний случай).
-    """
     try:
-        import pytz  # предпочтительно для pandas
+        import pytz
         return pytz.timezone("Europe/Kiev")
     except Exception:
         pass
@@ -28,25 +22,22 @@ def get_kyiv_tz():
         return ZoneInfo("Europe/Kyiv")
     except Exception:
         pass
-    return timezone(timedelta(hours=3))  # без переходов, но стабильно
+    return timezone(timedelta(hours=3))
 
 KYIV_TZ = get_kyiv_tz()
 
 # =========================
 # НАЛАШТУВАННЯ (ENV + секретный файл)
 # =========================
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # спрячь в Render → Environment
-WORKSHEET_NAME = "Лист1"                      # можно оставить в коде
-TOKEN = os.getenv("TOKEN")                    # спрячь в Render → Environment
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+WORKSHEET_NAME = "Лист1"
+TOKEN = os.getenv("TOKEN")
 
-# Секретный файл с ключами Google (Render → Secret Files: filename = gsheets.json)
 GOOGLE_JSON_PATH = "/etc/secrets/gsheets.json"
-
-# Кому слать отчёт (жёсткий список)
 CHAT_IDS = [727013047, 6555660815, 718885452]
 
 # =========================
-# ТОЧНИЙ ПЕРЕЛІК КАТЕГОРІЙ (як у таблиці)
+# Категории: КОД -> НАЗВАНИЕ
 # =========================
 CATEGORIES = {
     "CL1": "Дзвінки дрібні",
@@ -59,17 +50,13 @@ CATEGORIES = {
     "HS1": "Опрацювання історії легке",
     "HS2": "Опрацювання історії середнє",
     "HS3": "Опрацювання історії складне",
-    "REP": "Повторне звернення"
+    "REP": "Повторне звернення",
 }
-CAT_CALL_SMALL  = CATEGORIES["CL1"]
-CAT_CALL_MEDIUM = CATEGORIES["CL2"]
-CAT_CALL_LONG   = CATEGORIES["CL3"]
-CAT_CHAT        = CATEGORIES["SMS"]
-CAT_CONF        = CATEGORIES["CNF"]
-CAT_SB          = CATEGORIES["SEC"]
+# Обратная карта: НАЗВАНИЕ -> КОД (на случай, если в таблице названия)
+NAME2CODE = {v: k for k, v in CATEGORIES.items()}
 
 # =========================
-# ДАТИ — РАХУЄМО СТРОГО ВЧОРА (за Києвом)
+# ДАТЫ — СТРОГО ВЧЕРА (Киев)
 # =========================
 def now_kyiv():
     try:
@@ -78,9 +65,9 @@ def now_kyiv():
         return datetime.now(timezone.utc).astimezone(KYIV_TZ)
 
 _now = now_kyiv()
-report_day = (_now - timedelta(days=1)).date()                      # ← ВЧОРА
-start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)      # 00:00 вчера
-end_date_exclusive = start_date + timedelta(days=1)                        # 00:00 сегодня (исключительно)
+report_day = (_now - timedelta(days=1)).date()
+start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)
+end_date_exclusive = start_date + timedelta(days=1)
 
 # =========================
 # ІНФРА
@@ -130,26 +117,33 @@ rename_map = {
 df = df.rename(columns=rename_map)
 
 # =========================
-# Парс дат: ВХОД В UTC → КОНВЕРСИЯ В КИЕВ
-# (если в таблице уже Киевское время без TZ, можно заменить на tz_localize — см. комментарий ниже)
+# Даты в Киев
 # =========================
 dt_utc = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
 df["dt_kyiv"] = dt_utc.dt.tz_convert(KYIV_TZ)
 df = df.dropna(subset=["dt_kyiv"])
 
-# --- Если ваши значения в таблице уже в местном времени без часового пояса (а не UTC) — используйте это вместо блока выше:
-# dt_local = pd.to_datetime(df["datetime"], errors="coerce")           # без utc=True
-# df["dt_kyiv"] = dt_local.dt.tz_localize(KYIV_TZ, nonexistent='shift_forward', ambiguous='NaT')
-# df = df.dropna(subset=["dt_kyiv"])
+# =========================
+# Нормализуем категории (код + название)
+# =========================
+def to_code(val: str) -> str:
+    v = str(val).strip()
+    if v in CATEGORIES:          # уже код
+        return v
+    if v in NAME2CODE:           # было название
+        return NAME2CODE[v]
+    return v                     # неизвестное — оставим как есть
 
-# Фільтр: тільки ВЧОРА по Києву (напіввідкритий інтервал)
+for col in ["employee", "category", "phone", "status", "comment"]:
+    if col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+
+df["category_code"] = df["category"].apply(to_code)
+df["category_name"] = df["category_code"].map(CATEGORIES).fillna(df["category"])
+
+# Фільтр: тільки ВЧОРА (напіввідкритий інтервал)
 mask_day = (df["dt_kyiv"] >= start_date) & (df["dt_kyiv"] < end_date_exclusive)
 day_df = df.loc[mask_day].copy()
-
-# Нормалізація тексту
-for col in ["employee", "category", "phone", "status", "comment"]:
-    if col in day_df.columns:
-        day_df[col] = day_df[col].astype(str).str.strip()
 
 # “Виконано”
 done_df = day_df[day_df["status"].str.lower() == "виконано"].copy()
@@ -172,8 +166,9 @@ uniq_clients_by_employee = (
     .sort_values(ascending=False).rename("unique_clients").reset_index()
 )
 
+# Группировка для вывода категорий — по ЧЕЛОВЕЧЕСКОМУ имени
 cats = (
-    done_df.groupby("category")["status"].count()
+    done_df.groupby("category_name")["status"].count()
     .sort_values(ascending=False).rename("tasks").reset_index()
 )
 
@@ -182,26 +177,25 @@ top_clients = (
     .sort_values(ascending=False).head(3).rename("events").reset_index()
 )
 
-# Дзвінки/години/чати/конференції/СБ (строго по категоріях)
-calls_small  = int((done_df["category"] == CAT_CALL_SMALL).sum())
-calls_medium = int((done_df["category"] == CAT_CALL_MEDIUM).sum())
-calls_long   = int((done_df["category"] == CAT_CALL_LONG).sum())
+# ======= Правильные счётчики по КОДАМ =======
+calls_small  = int((done_df["category_code"] == "CL1").sum())
+calls_medium = int((done_df["category_code"] == "CL2").sum())
+calls_long   = int((done_df["category_code"] == "CL3").sum())
 total_calls  = calls_small + calls_medium + calls_long
 
 AVG_MIN_SMALL, AVG_MIN_MEDIUM, AVG_MIN_LONG = 10, 30, 50
 total_minutes = calls_small*AVG_MIN_SMALL + calls_medium*AVG_MIN_MEDIUM + calls_long*AVG_MIN_LONG
 total_hours = round(total_minutes / 60, 2)
 
-total_chats = int((done_df["category"] == CAT_CHAT).sum())
-total_conferences = int((done_df["category"] == CAT_CONF).sum())
+total_chats = int((done_df["category_code"] == "SMS").sum())
+total_conferences = int((done_df["category_code"] == "CNF").sum())
 
-sb_df = done_df[done_df["category"] == CAT_SB]
-sb_unique_clients = sb_df["phone"].nunique(dropna=True)
+sb_df = done_df[done_df["category_code"] == "SEC"]
+sb_unique_clients = int(sb_df["phone"].nunique(dropna=True))
 
 # =========================
-# ЛІНІЙНИЙ ГРАФІК: звернення по годинах (усі події ВЧОРА, за Києвом)
+# ЛІНІЙНИЙ ГРАФІК (вчора, Київ)
 # =========================
-# часовая сетка 00:00..23:00 (вчера)
 hidx = pd.date_range(start=start_date, end=end_date_exclusive - timedelta(hours=1),
                      freq="H", tz=KYIV_TZ)
 events_by_hour = (
@@ -211,7 +205,7 @@ events_by_hour = (
 hour_labels = hidx.strftime("%H:%M")
 
 # =========================
-# ДАШБОРД (1 большой line + 2 вертикальные bar)
+# ДАШБОРД
 # =========================
 from matplotlib.gridspec import GridSpec
 
@@ -219,7 +213,6 @@ fig = plt.figure(figsize=(16, 9))
 gs = fig.add_gridspec(2, 2, height_ratios=[1.4, 1.0], hspace=0.4, wspace=0.25)
 fig.suptitle(f"Підтримка • Денний звіт {start_date.strftime('%d.%m.%Y')} (час Києва)", fontsize=18, fontweight="bold")
 
-# ВЕРХ: лінія
 ax0 = fig.add_subplot(gs[0, :])
 ax0.plot(hour_labels, events_by_hour.values, marker="o")
 ax0.set_title("Звернення по годинах (усі події, час Києва)")
@@ -228,7 +221,6 @@ ax0.set_ylabel("К-сть звернень")
 ax0.set_xticks(range(0, len(hour_labels), max(1, len(hour_labels)//8)))
 ax0.tick_params(axis='x', rotation=45)
 
-# НИЗ ЛІВО: Унікальні клієнти по співробітнику
 ax1 = fig.add_subplot(gs[1, 0])
 x1 = np.arange(len(uniq_clients_by_employee))
 ax1.bar(x1, uniq_clients_by_employee["unique_clients"])
@@ -239,12 +231,11 @@ ax1.set_ylabel("К-сть унікальних телефонів")
 for i, v in enumerate(uniq_clients_by_employee["unique_clients"]):
     ax1.text(i, v + 0.05, str(int(v)), ha='center', va='bottom')
 
-# НИЗ ПРАВО: Розподіл задач за категоріями
 ax2 = fig.add_subplot(gs[1, 1])
 x2 = np.arange(len(cats))
 ax2.bar(x2, cats["tasks"])
 ax2.set_xticks(x2)
-ax2.set_xticklabels(cats["category"], rotation=45, ha="right")
+ax2.set_xticklabels(cats["category_name"], rotation=45, ha="right")
 ax2.set_title("Розподіл задач за категоріями")
 ax2.set_ylabel("К-сть задач")
 for i, v in enumerate(cats["tasks"]):
@@ -276,7 +267,8 @@ for _, r in tasks_by_employee.iterrows():
     emp_lines.append(f"• <b>{emp}</b> — задач: <b>{t}</b> {badge(t)} | унікальних клієнтів: <b>{u}</b>")
 employees_inline_text = "\n".join(emp_lines)
 
-cat_lines = [f"• <b>{row['category']}</b>: {int(row['tasks'])}" for _, row in cats.iterrows()]
+# Печатаем человечьи названия категорий
+cat_lines = [f"• <b>{row['category_name']}</b>: {int(row['tasks'])}" for _, row in cats.iterrows()]
 cats_inline_text = "\n".join(cat_lines)
 
 top_lines = [f"• <b>{row['phone']}</b>: {int(row['events'])}" for _, row in top_clients.iterrows()]
@@ -299,7 +291,7 @@ kpi_text = (
 )
 
 # =========================
-# ВІДПРАВКА: спочатку дашборд, потім текст
+# ВІДПРАВКА
 # =========================
 send_photo(dashboard_img, CHAT_IDS)
 send_message(kpi_text, CHAT_IDS)
