@@ -14,7 +14,7 @@ from google.oauth2.service_account import Credentials
 def get_kyiv_tz():
     try:
         import pytz
-        return pytz.timezone("Europe/Kiev")
+        return pytz.timezone("Europe/Kiev")   # для pandas это самый беспроблемный вариант
     except Exception:
         pass
     try:
@@ -22,7 +22,7 @@ def get_kyiv_tz():
         return ZoneInfo("Europe/Kyiv")
     except Exception:
         pass
-    return timezone(timedelta(hours=3))
+    return timezone(timedelta(hours=3))       # fallback без DST
 
 KYIV_TZ = get_kyiv_tz()
 
@@ -32,7 +32,6 @@ KYIV_TZ = get_kyiv_tz()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 WORKSHEET_NAME = "Лист1"
 TOKEN = os.getenv("TOKEN")
-
 GOOGLE_JSON_PATH = "/etc/secrets/gsheets.json"
 CHAT_IDS = [727013047, 6555660815, 718885452]
 
@@ -52,11 +51,10 @@ CATEGORIES = {
     "HS3": "Опрацювання історії складне",
     "REP": "Повторне звернення",
 }
-# Обратная карта: НАЗВАНИЕ -> КОД (на случай, если в таблице названия)
 NAME2CODE = {v: k for k, v in CATEGORIES.items()}
 
 # =========================
-# ДАТЫ — СТРОГО ВЧЕРА (Киев)
+# ДАТЫ — звіт строго за ВЧОРА (Київ)
 # =========================
 def now_kyiv():
     try:
@@ -65,12 +63,12 @@ def now_kyiv():
         return datetime.now(timezone.utc).astimezone(KYIV_TZ)
 
 _now = now_kyiv()
-report_day = (_now - timedelta(days=1)).date()
-start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)
-end_date_exclusive = start_date + timedelta(days=1)
+report_day = (_now - timedelta(days=1)).date()                           # вчора
+start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)    # 00:00 Київ
+end_date_exclusive = start_date + timedelta(days=1)                      # напіввідкритий інтервал
 
 # =========================
-# ІНФРА
+# Інфра
 # =========================
 def get_gspread_client():
     creds = Credentials.from_service_account_file(
@@ -97,7 +95,7 @@ def send_photo(image_path, chat_ids):
             print(f"send_photo error for {chat_id}: {e}")
 
 # =========================
-# ЗАВАНТАЖЕННЯ ДАНИХ
+# Завантаження даних
 # =========================
 gc = get_gspread_client()
 sh = gc.open_by_key(SPREADSHEET_ID)
@@ -117,31 +115,31 @@ rename_map = {
 df = df.rename(columns=rename_map)
 
 # =========================
-# Даты в Киев
+# ДАТЫ: у таблиці UTC -> у звіті Київ
+# (якщо в комірках час без TZ — трактуємо як UTC, далі конвертуємо у Київ)
 # =========================
-dt_utc = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
-df["dt_kyiv"] = dt_utc.dt.tz_convert(KYIV_TZ)
+dt_any_utc = pd.to_datetime(df["datetime"], errors="coerce", utc=True)       # локалізує як UTC навіть для naive
+df["dt_kyiv"] = dt_any_utc.dt.tz_convert(KYIV_TZ)                            # переводимо у Київ
 df = df.dropna(subset=["dt_kyiv"])
 
-# =========================
-# Нормализуем категории (код + название)
-# =========================
-def to_code(val: str) -> str:
-    v = str(val).strip()
-    if v in CATEGORIES:          # уже код
-        return v
-    if v in NAME2CODE:           # было название
-        return NAME2CODE[v]
-    return v                     # неизвестное — оставим как есть
-
+# Нормалізація текстових полів
 for col in ["employee", "category", "phone", "status", "comment"]:
     if col in df.columns:
         df[col] = df[col].astype(str).str.strip()
 
+# Нормалізуємо категорії (код + назва)
+def to_code(val: str) -> str:
+    v = str(val).strip()
+    if v in CATEGORIES:   # це код
+        return v
+    if v in NAME2CODE:    # було назва
+        return NAME2CODE[v]
+    return v
+
 df["category_code"] = df["category"].apply(to_code)
 df["category_name"] = df["category_code"].map(CATEGORIES).fillna(df["category"])
 
-# Фільтр: тільки ВЧОРА (напіввідкритий інтервал)
+# Фільтр: тільки ВЧОРА (Київ)
 mask_day = (df["dt_kyiv"] >= start_date) & (df["dt_kyiv"] < end_date_exclusive)
 day_df = df.loc[mask_day].copy()
 
@@ -149,7 +147,7 @@ day_df = df.loc[mask_day].copy()
 done_df = day_df[day_df["status"].str.lower() == "виконано"].copy()
 
 # =========================
-# МЕТРИКИ (денні)
+# Метрики (денні)
 # =========================
 total_tasks = len(done_df)
 
@@ -166,7 +164,7 @@ uniq_clients_by_employee = (
     .sort_values(ascending=False).rename("unique_clients").reset_index()
 )
 
-# Группировка для вывода категорий — по ЧЕЛОВЕЧЕСКОМУ имени
+# Для виводу категорій — людські назви
 cats = (
     done_df.groupby("category_name")["status"].count()
     .sort_values(ascending=False).rename("tasks").reset_index()
@@ -177,7 +175,7 @@ top_clients = (
     .sort_values(ascending=False).head(3).rename("events").reset_index()
 )
 
-# ======= Правильные счётчики по КОДАМ =======
+# Лічильники по кодам
 calls_small  = int((done_df["category_code"] == "CL1").sum())
 calls_medium = int((done_df["category_code"] == "CL2").sum())
 calls_long   = int((done_df["category_code"] == "CL3").sum())
@@ -189,35 +187,38 @@ total_hours = round(total_minutes / 60, 2)
 
 total_chats = int((done_df["category_code"] == "SMS").sum())
 total_conferences = int((done_df["category_code"] == "CNF").sum())
-
 sb_df = done_df[done_df["category_code"] == "SEC"]
 sb_unique_clients = int(sb_df["phone"].nunique(dropna=True))
 
 # =========================
-# ЛІНІЙНИЙ ГРАФІК (вчора, Київ)
+# ЛІНІЙНИЙ ГРАФІК АКТИВНОСТІ (вчора, Київ)
 # =========================
-# 1) Сітка годин 00:00..23:00 (вчора, Київ)
-hidx = pd.date_range(
-    start=start_date,
-    end=end_date_exclusive - timedelta(hours=1),
-    freq="H",
-    tz=KYIV_TZ,
-)
+# Сітка годин 00..23 (Київ)
+hidx = pd.date_range(start=start_date, end=end_date_exclusive - timedelta(hours=1), freq="H", tz=KYIV_TZ)
 
-# 2) Приводимо кожну подію до початку години і рахуємо по годинах
+# Надійний підрахунок: беремо всі події дня, округляємо до початку години
 hour_floor = day_df["dt_kyiv"].dt.tz_convert(KYIV_TZ).dt.floor("H")
 events_by_hour = (
     hour_floor.value_counts()
-    .reindex(hidx, fill_value=0)   # гарантуємо всі години дня
+    .reindex(hidx, fill_value=0)
     .sort_index()
 )
 
-# 3) Підписи осі X
-hour_labels = [d.strftime("%H:%M") for d in hidx]
+# Fallback на випадок дивних TZ-різниць: рахуємо по номеру години 0..23
+if events_by_hour.values.sum() == 0 and len(day_df) > 0:
+    by_hour_int = (day_df["dt_kyiv"].dt.hour.value_counts().reindex(range(24), fill_value=0))
+    hour_labels = [f"{h:02d}:00" for h in range(24)]
+    events_values = by_hour_int.values
+else:
+    hour_labels = [d.strftime("%H:%M") for d in hidx]
+    events_values = events_by_hour.values
 
+# Для підписів піків/мінімумів
+peak_idx = np.argsort(-events_values)[:3]                   # топ-3 години
+valley_idx = np.argsort(events_values)[:1]                  # мінімум (одна година)
 
 # =========================
-# ДАШБОРД
+# Дашборд
 # =========================
 from matplotlib.gridspec import GridSpec
 
@@ -225,14 +226,25 @@ fig = plt.figure(figsize=(16, 9))
 gs = fig.add_gridspec(2, 2, height_ratios=[1.4, 1.0], hspace=0.4, wspace=0.25)
 fig.suptitle(f"Підтримка • Денний звіт {start_date.strftime('%d.%m.%Y')} (час Києва)", fontsize=18, fontweight="bold")
 
+# Верх: лінія активності
 ax0 = fig.add_subplot(gs[0, :])
-ax0.plot(hour_labels, events_by_hour.values, marker="o")
+ax0.plot(hour_labels, events_values, marker="o")
 ax0.set_title("Звернення по годинах (усі події, час Києва)")
 ax0.set_xlabel("Час")
 ax0.set_ylabel("К-сть звернень")
 ax0.set_xticks(range(0, len(hour_labels), max(1, len(hour_labels)//8)))
 ax0.tick_params(axis='x', rotation=45)
+ax0.set_ylim(bottom=0, top=max(1, int(max(events_values) * 1.2)))
 
+# позначимо піки/мінімум
+for i in peak_idx:
+    ax0.annotate(f"пік: {events_values[i]}", (i, events_values[i]),
+                 textcoords="offset points", xytext=(0, 8), ha="center", fontsize=9)
+for i in valley_idx:
+    ax0.annotate(f"мін: {events_values[i]}", (i, events_values[i]),
+                 textcoords="offset points", xytext=(0, -12), ha="center", fontsize=9)
+
+# Низ ліворуч: унікальні клієнти по співробітнику
 ax1 = fig.add_subplot(gs[1, 0])
 x1 = np.arange(len(uniq_clients_by_employee))
 ax1.bar(x1, uniq_clients_by_employee["unique_clients"])
@@ -243,6 +255,7 @@ ax1.set_ylabel("К-сть унікальних телефонів")
 for i, v in enumerate(uniq_clients_by_employee["unique_clients"]):
     ax1.text(i, v + 0.05, str(int(v)), ha='center', va='bottom')
 
+# Низ праворуч: розподіл задач за категоріями (людські назви)
 ax2 = fig.add_subplot(gs[1, 1])
 x2 = np.arange(len(cats))
 ax2.bar(x2, cats["tasks"])
@@ -259,7 +272,7 @@ fig.savefig(dashboard_img, dpi=200, bbox_inches="tight")
 plt.close(fig)
 
 # =========================
-# ТЕКСТ
+# Текст звіту
 # =========================
 max_tasks = tasks_by_employee["tasks_done"].max() if len(tasks_by_employee) else 0
 min_tasks = tasks_by_employee["tasks_done"].min() if len(tasks_by_employee) else 0
@@ -279,7 +292,6 @@ for _, r in tasks_by_employee.iterrows():
     emp_lines.append(f"• <b>{emp}</b> — задач: <b>{t}</b> {badge(t)} | унікальних клієнтів: <b>{u}</b>")
 employees_inline_text = "\n".join(emp_lines)
 
-# Печатаем человечьи названия категорий
 cat_lines = [f"• <b>{row['category_name']}</b>: {int(row['tasks'])}" for _, row in cats.iterrows()]
 cats_inline_text = "\n".join(cat_lines)
 
@@ -303,7 +315,7 @@ kpi_text = (
 )
 
 # =========================
-# ВІДПРАВКА
+# Відправка
 # =========================
 send_photo(dashboard_img, CHAT_IDS)
 send_message(kpi_text, CHAT_IDS)
