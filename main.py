@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 import os
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time  # ← добавлен time
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -68,7 +69,7 @@ CAT_CONF        = CATEGORIES["CNF"]
 CAT_SB          = CATEGORIES["SEC"]
 
 # =========================
-# ДАТИ СЬОГОДНІ ЗА КИЄВОМ (00:00–23:59:59)
+# ДАТИ — РАХУЄМО СТРОГО ВЧОРА (за Києвом)
 # =========================
 def now_kyiv():
     try:
@@ -77,15 +78,9 @@ def now_kyiv():
         return datetime.now(timezone.utc).astimezone(KYIV_TZ)
 
 _now = now_kyiv()
-report_day = (_now - timedelta(days=1)).date()  # ВЧОРА
-
-start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)   # 00:00
-end_date = start_date + timedelta(days=1)                     # наступний день 00:00
-
-# фильтр:
-mask_day = (df["dt_kyiv"] >= start_date) & (df["dt_kyiv"] < end_date_exclusive)
-day_df = df.loc[mask_day].copy()
-
+report_day = (_now - timedelta(days=1)).date()                      # ← ВЧОРА
+start_date = datetime.combine(report_day, time(0, 0), tzinfo=KYIV_TZ)      # 00:00 вчера
+end_date_exclusive = start_date + timedelta(days=1)                        # 00:00 сегодня (исключительно)
 
 # =========================
 # ІНФРА
@@ -135,14 +130,20 @@ rename_map = {
 df = df.rename(columns=rename_map)
 
 # =========================
-# Парс дат: ВХОД В UTC → ДАЛЕЕ КОНВЕРСИЯ В КИЕВ
+# Парс дат: ВХОД В UTC → КОНВЕРСИЯ В КИЕВ
+# (если в таблице уже Киевское время без TZ, можно заменить на tz_localize — см. комментарий ниже)
 # =========================
 dt_utc = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
 df["dt_kyiv"] = dt_utc.dt.tz_convert(KYIV_TZ)
 df = df.dropna(subset=["dt_kyiv"])
 
-# Фільтр: тільки сьогодні по Києву
-mask_day = (df["dt_kyiv"] >= start_date) & (df["dt_kyiv"] <= end_date)
+# --- Если ваши значения в таблице уже в местном времени без часового пояса (а не UTC) — используйте это вместо блока выше:
+# dt_local = pd.to_datetime(df["datetime"], errors="coerce")           # без utc=True
+# df["dt_kyiv"] = dt_local.dt.tz_localize(KYIV_TZ, nonexistent='shift_forward', ambiguous='NaT')
+# df = df.dropna(subset=["dt_kyiv"])
+
+# Фільтр: тільки ВЧОРА по Києву (напіввідкритий інтервал)
+mask_day = (df["dt_kyiv"] >= start_date) & (df["dt_kyiv"] < end_date_exclusive)
 day_df = df.loc[mask_day].copy()
 
 # Нормалізація тексту
@@ -198,26 +199,16 @@ sb_df = done_df[done_df["category"] == CAT_SB]
 sb_unique_clients = sb_df["phone"].nunique(dropna=True)
 
 # =========================
-# ЛІНІЙНИЙ ГРАФІК: звернення по годинах (всі події дня, за Києвом)
+# ЛІНІЙНИЙ ГРАФІК: звернення по годинах (усі події ВЧОРА, за Києвом)
 # =========================
+# часовая сетка 00:00..23:00 (вчера)
+hidx = pd.date_range(start=start_date, end=end_date_exclusive - timedelta(hours=1),
+                     freq="H", tz=KYIV_TZ)
 events_by_hour = (
     day_df.set_index("dt_kyiv").sort_index()
           .resample("H").size()
-          .rename("count")
-)
-
-hidx = pd.date_range(
-    start=start_date,
-    end=end_date.replace(minute=0, second=0, microsecond=0),
-    freq="H",
-    tz=KYIV_TZ
-)
-events_by_hour = events_by_hour.reindex(hidx, fill_value=0)
-
-try:
-    hour_labels = events_by_hour.index.tz_convert(KYIV_TZ).strftime("%H:%M")
-except Exception:
-    hour_labels = events_by_hour.index.strftime("%H:%M")
+).reindex(hidx, fill_value=0)
+hour_labels = hidx.strftime("%H:%M")
 
 # =========================
 # ДАШБОРД (1 большой line + 2 вертикальные bar)
@@ -234,7 +225,7 @@ ax0.plot(hour_labels, events_by_hour.values, marker="o")
 ax0.set_title("Звернення по годинах (усі події, час Києва)")
 ax0.set_xlabel("Час")
 ax0.set_ylabel("К-сть звернень")
-ax0.set_xticks(range(0, len(events_by_hour), max(1, len(events_by_hour)//8)))
+ax0.set_xticks(range(0, len(hour_labels), max(1, len(hour_labels)//8)))
 ax0.tick_params(axis='x', rotation=45)
 
 # НИЗ ЛІВО: Унікальні клієнти по співробітнику
