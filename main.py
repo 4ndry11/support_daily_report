@@ -116,10 +116,9 @@ df = df.rename(columns=rename_map)
 
 # =========================
 # ДАТЫ: у таблиці UTC -> у звіті Київ
-# (якщо в комірках час без TZ — трактуємо як UTC, далі конвертуємо у Київ)
 # =========================
-dt_any_utc = pd.to_datetime(df["datetime"], errors="coerce", utc=True)       # локалізує як UTC навіть для naive
-df["dt_kyiv"] = dt_any_utc.dt.tz_convert(KYIV_TZ)                            # переводимо у Київ
+dt_any_utc = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+df["dt_kyiv"] = dt_any_utc.dt.tz_convert(KYIV_TZ)
 df = df.dropna(subset=["dt_kyiv"])
 
 # Нормалізація текстових полів
@@ -151,6 +150,7 @@ done_df = day_df[day_df["status"].str.lower() == "виконано"].copy()
 # =========================
 total_tasks = len(done_df)
 
+# Загальна частка повторних звернень (подій) — як було у тебе
 phone_counts = done_df["phone"].value_counts()
 repeat_rate = round((phone_counts[phone_counts > 1].sum() / phone_counts.sum()) * 100, 2) if phone_counts.sum() else 0
 
@@ -189,6 +189,49 @@ total_chats = int((done_df["category_code"] == "SMS").sum())
 total_conferences = int((done_df["category_code"] == "CNF").sum())
 sb_df = done_df[done_df["category_code"] == "SEC"]
 sb_unique_clients = int(sb_df["phone"].nunique(dropna=True))
+
+# =========================
+# === НОВЕ: повторні звернення по співробітниках (клієнти з ≥2 зверненнями за день)
+# =========================
+THRESHOLD_REPEAT = 30  # поріг, %
+
+# таблиця "employee, phone, events"
+emp_phone = (
+    done_df.groupby(["employee", "phone"])["status"]
+    .count()
+    .rename("events")
+    .reset_index()
+)
+
+# скільки у співробітника було унікальних клієнтів і скільки з них зверталися 2+ рази
+tot_clients = emp_phone.groupby("employee")["phone"].nunique().rename("total_clients")
+rep_clients = (
+    emp_phone[emp_phone["events"] >= 2]
+    .groupby("employee")["phone"].nunique()
+    .rename("repeat_clients")
+)
+
+repeat_by_employee = (
+    pd.concat([tot_clients, rep_clients], axis=1)
+    .fillna(0)
+    .reset_index()
+)
+
+# частка повторних клієнтів у % (округлено до 2 знаків)
+repeat_by_employee["repeat_share_pct"] = (
+    (repeat_by_employee["repeat_clients"] / repeat_by_employee["total_clients"].replace({0: np.nan})) * 100
+).fillna(0).round(2)
+
+# для зручності — зведемо в один датафрейм разом із задачами/унік. клієнтами
+emp_summary = (
+    tasks_by_employee
+    .merge(uniq_clients_by_employee, on="employee", how="outer")
+    .merge(repeat_by_employee, on="employee", how="outer")
+    .fillna(0)
+)
+
+# Відсортуємо за часткою повторних (спадно), щоб звертати увагу на «ризикових»
+emp_summary = emp_summary.sort_values(["repeat_share_pct", "tasks_done"], ascending=[False, False]).reset_index(drop=True)
 
 # =========================
 # ЛІНІЙНИЙ ГРАФІК АКТИВНОСТІ (вчора, Київ)
@@ -246,13 +289,13 @@ for i in valley_idx:
 
 # Низ ліворуч: унікальні клієнти по співробітнику
 ax1 = fig.add_subplot(gs[1, 0])
-x1 = np.arange(len(uniq_clients_by_employee))
-ax1.bar(x1, uniq_clients_by_employee["unique_clients"])
+x1 = np.arange(len(emp_summary))
+ax1.bar(x1, emp_summary["unique_clients"])
 ax1.set_xticks(x1)
-ax1.set_xticklabels(uniq_clients_by_employee["employee"], rotation=45, ha="right")
+ax1.set_xticklabels(emp_summary["employee"], rotation=45, ha="right")
 ax1.set_title("Унікальні клієнти по співробітнику")
 ax1.set_ylabel("К-сть унікальних телефонів")
-for i, v in enumerate(uniq_clients_by_employee["unique_clients"]):
+for i, v in enumerate(emp_summary["unique_clients"]):
     ax1.text(i, v + 0.05, str(int(v)), ha='center', va='bottom')
 
 # Низ праворуч: розподіл задач за категоріями (людські назви)
@@ -277,7 +320,7 @@ plt.close(fig)
 max_tasks = tasks_by_employee["tasks_done"].max() if len(tasks_by_employee) else 0
 min_tasks = tasks_by_employee["tasks_done"].min() if len(tasks_by_employee) else 0
 
-def badge(tasks):
+def badge_tasks(tasks):
     b = []
     if tasks == max_tasks and tasks > 0:
         b.append("🏆")
@@ -285,12 +328,32 @@ def badge(tasks):
         b.append("🔴")
     return " ".join(b)
 
-u_map = dict(zip(uniq_clients_by_employee["employee"], uniq_clients_by_employee["unique_clients"]))
+# мапа співробітник -> к-сть унікальних клієнтів
+u_map = dict(zip(emp_summary["employee"], emp_summary["unique_clients"]))
+
+# рядки по співробітниках: задачі + унік. клієнти
 emp_lines = []
-for _, r in tasks_by_employee.iterrows():
-    emp = r["employee"]; t = int(r["tasks_done"]); u = int(u_map.get(emp, 0))
-    emp_lines.append(f"• <b>{emp}</b> — задач: <b>{t}</b> {badge(t)} | унікальних клієнтів: <b>{u}</b>")
+for _, r in emp_summary.iterrows():
+    emp = r["employee"]
+    t = int(r.get("tasks_done", 0))
+    u = int(r.get("unique_clients", 0))
+    emp_lines.append(f"• <b>{emp}</b> — задач: <b>{t}</b> {badge_tasks(t)} | унікальних клієнтів: <b>{u}</b>")
 employees_inline_text = "\n".join(emp_lines)
+
+# === НОВЕ: блок «Повторні звернення по співробітниках» з порогом 30%
+rep_lines = []
+for _, r in emp_summary.iterrows():
+    emp = r["employee"]
+    total_c = int(r.get("total_clients", 0))
+    repeat_c = int(r.get("repeat_clients", 0))
+    share = float(r.get("repeat_share_pct", 0.0))
+    flag = "🔴" if share > THRESHOLD_REPEAT else "🟢"
+    # якщо за день не було клієнтів — покажемо 0%
+    rep_lines.append(
+        f"• <b>{emp}</b> — повторні клієнти: <b>{share}%</b> "
+        f"({repeat_c} з {total_c}) {flag}"
+    )
+repeat_inline_text = "\n".join(rep_lines)
 
 cat_lines = [f"• <b>{row['category_name']}</b>: {int(row['tasks'])}" for _, row in cats.iterrows()]
 cats_inline_text = "\n".join(cat_lines)
@@ -301,7 +364,7 @@ top_inline_text = "\n".join(top_lines)
 kpi_text = (
     f"📊 <b>Денний звіт підтримки</b> ({start_date.strftime('%d.%m.%Y')} — час Києва)\n\n"
     f"✅ Всього виконано задач: <b>{total_tasks}</b>\n"
-    f"🔁 Частка повторних звернень (за день): <b>{repeat_rate}%</b>\n\n"
+    f"🔁 Частка повторних звернень (за день, по подіях): <b>{repeat_rate}%</b>\n\n"
     f"☎️ <b>Дзвінки</b>: всього <b>{total_calls}</b> "
     f"(короткі: <b>{calls_small}</b>, середні: <b>{calls_medium}</b>, довготривалі: <b>{calls_long}</b>)\n"
     f"⏱️ <b>Годин у розмові</b> (оцінка): <b>{total_hours} год</b>\n"
@@ -309,6 +372,8 @@ kpi_text = (
     f"🎥 <b>Проведені конференції</b>: <b>{total_conferences}</b>\n"
     f"🧩 <b>СБ (супровід)</b> — унікальних клієнтів: <b>{sb_unique_clients}</b>\n\n"
     f"👥 <b>По співробітниках</b>:\n{employees_inline_text}\n\n"
+    f"🔁 <b>Повторні звернення по співробітниках</b> "
+    f"(клієнти з ≥2 зверненнями; поріг: {THRESHOLD_REPEAT}%):\n{repeat_inline_text}\n\n"
     f"🏷️ <b>Категорії (розподіл задач)</b>:\n{cats_inline_text}\n\n"
     f"📱 <b>Топ-3 клієнтів за зверненнями</b>:\n{top_inline_text}\n\n"
     f"📈 Лінійний графік звернень по годинах — див. на дашборді (час Києва)."
