@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import requests
 from datetime import datetime, timedelta, timezone, time
 import pandas as pd
@@ -7,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import gspread
 from google.oauth2.service_account import Credentials
+from typing import List, Dict, Any
 
 # =========================
 # TZ helpers (стабильно для pandas)
@@ -27,13 +29,24 @@ def get_kyiv_tz():
 KYIV_TZ = get_kyiv_tz()
 
 # =========================
-# НАЛАШТУВАННЯ (ENV + секретный файл)
+# НАЛАШТУВАННЯ (ENV + секретний файл)
 # =========================
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 WORKSHEET_NAME = "Лист1"
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("TOKEN")  # Telegram Bot Token (HTTP API)
 GOOGLE_JSON_PATH = "/etc/secrets/gsheets.json"
-CHAT_IDS = [727013047, 6555660815, 718885452]
+
+# Основные чаты для звіту підтримки
+CHAT_IDS = [int(x) for x in os.getenv("CHAT_IDS", "727013047,6555660815,718885452").split(",") if x.strip()]
+
+# === Новое: Bitrix для дней рождения ===
+BITRIX_CONTACT_URL = os.getenv("BITRIX_CONTACT_URL")  # .../crm.contact.list.json
+BITRIX_USERS_URL   = os.getenv("BITRIX_USERS_URL")    # .../user.get.json
+
+# === Новое: отдельные чаты для ДР (опционально). Если не указано — используем CHAT_IDS.
+BIRTHDAYS_CHAT_IDS = [int(x) for x in os.getenv("BIRTHDAYS_CHAT_IDS", "").split(",") if x.strip()]
+if not BIRTHDAYS_CHAT_IDS:
+    BIRTHDAYS_CHAT_IDS = CHAT_IDS
 
 # =========================
 # Категории: КОД -> НАЗВАНИЕ
@@ -95,7 +108,142 @@ def send_photo(image_path, chat_ids):
             print(f"send_photo error for {chat_id}: {e}")
 
 # =========================
-# Завантаження даних
+# Bitrix helpers для ДР
+# =========================
+def b24_paged_get(url: str, base_params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Пагинация Bitrix24: ?start=N, собираем весь result/items."""
+    items: List[Dict[str, Any]] = []
+    start = 0
+    while True:
+        params = dict(base_params or {})
+        params["start"] = start
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"❌ Bitrix request failed ({url}): {e}")
+            break
+
+        chunk = data.get("result", [])
+        if isinstance(chunk, dict) and "items" in chunk:
+            chunk = chunk.get("items", [])
+        if not chunk:
+            # если вернулась ошибка API (например, INVALID_CREDENTIALS)
+            if "error" in data:
+                print(f"❌ Bitrix error: {data.get('error')} {data.get('error_description')}")
+            break
+
+        items.extend(chunk)
+        next_start = data.get("next")
+        if next_start is None:
+            break
+        start = next_start
+    return items
+
+def clean_phone(p: str) -> str:
+    return re.sub(r"\D", "", p or "")
+
+def normalize_phone(phone: str) -> str:
+    digits = clean_phone(phone)
+    if not digits:
+        return ""
+    if digits.startswith("0"):
+        digits = "38" + digits
+    if not digits.startswith("380"):
+        digits = "380" + digits.lstrip("380")
+    return "+" + digits
+
+def today_month_day():
+    n = now_kyiv()
+    return n.month, n.day
+
+def parse_b24_date(d: str):
+    """'YYYY-MM-DD' -> (month, day) | None"""
+    if not d:
+        return None
+    s = d.strip()[:10]
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return dt.month, dt.day
+    except Exception:
+        return None
+
+def b24_get_employees_birthday_today() -> List[Dict[str, Any]]:
+    """Сотрудники с ДР сегодня (PERSONAL_BIRTHDAY), фильтруем ACTIVE на клиенте."""
+    if not BITRIX_USERS_URL:
+        print("⚠ BITRIX_USERS_URL not set; skip employees birthdays")
+        return []
+    month_today, day_today = today_month_day()
+    items = b24_paged_get(
+        BITRIX_USERS_URL,
+        {"SELECT[]": ["ID", "NAME", "LAST_NAME", "PERSONAL_BIRTHDAY", "ACTIVE"]}
+    )
+    result = []
+    for u in items or []:
+        is_active = str(u.get("ACTIVE")).upper() in ("Y", "TRUE", "1")
+        if not is_active:
+            continue
+        md = parse_b24_date(u.get("PERSONAL_BIRTHDAY"))
+        if md and md == (month_today, day_today):
+            full_name = f"{(u.get('NAME') or '').strip()} {(u.get('LAST_NAME') or '').strip()}".strip() or "Без імені"
+            result.append({"id": u.get("ID"), "name": full_name})
+    result.sort(key=lambda x: x["name"].lower())
+    return result
+
+def b24_get_clients_birthday_today() -> List[Dict[str, Any]]:
+    """Клиенты с ДР сегодня (BIRTHDATE) + нормализованные телефоны."""
+    if not BITRIX_CONTACT_URL:
+        print("⚠ BITRIX_CONTACT_URL not set; skip clients birthdays")
+        return []
+    month_today, day_today = today_month_day()
+    items = b24_paged_get(
+        BITRIX_CONTACT_URL,
+        {"filter[!BIRTHDATE]": "", "select[]": ["ID", "NAME", "LAST_NAME", "BIRTHDATE", "PHONE"]}
+    )
+    result = []
+    for c in items or []:
+        md = parse_b24_date(c.get("BIRTHDATE"))
+        if not md or md != (month_today, day_today):
+            continue
+        full_name = f"{(c.get('NAME') or '').strip()} {(c.get('LAST_NAME') or '').strip()}".strip() or "Без імені"
+        phones = []
+        for ph in c.get("PHONE", []) or []:
+            val = normalize_phone(ph.get("VALUE", ""))
+            if val:
+                phones.append(val)
+        # уникальные телефоны
+        seen, uniq = set(), []
+        for p in phones:
+            k = clean_phone(p)
+            if k not in seen:
+                seen.add(k)
+                uniq.append(p)
+        result.append({"id": c.get("ID"), "name": full_name, "phones": uniq})
+    result.sort(key=lambda x: x["name"].lower())
+    return result
+
+def format_birthday_message() -> str:
+    employees = b24_get_employees_birthday_today()
+    clients = b24_get_clients_birthday_today()
+    if not employees and not clients:
+        return "📅 На сьогодні днів народження немає."
+    lines = ["🎂 Щоденна перевірка днів народження:"]
+    if employees:
+        lines.append("\n👥 Співробітники:")
+        for e in employees:
+            lines.append(f"• {e['name']}")
+    if clients:
+        lines.append("\n🧑‍💼 Клієнти:")
+        for c in clients:
+            if c["phones"]:
+                lines.append(f"• {c['name']} — {', '.join(c['phones'])}")
+            else:
+                lines.append(f"• {c['name']} — (тел. відсутній)")
+    return "\n".join(lines)
+
+# =========================
+# Завантаження даних підтримки
 # =========================
 gc = get_gspread_client()
 sh = gc.open_by_key(SPREADSHEET_ID)
@@ -150,7 +298,7 @@ done_df = day_df[day_df["status"].str.lower() == "виконано"].copy()
 # =========================
 total_tasks = len(done_df)
 
-# Загальна частка повторних звернень (подій) — як було у тебе
+# Загальна частка повторних звернень (подій)
 phone_counts = done_df["phone"].value_counts()
 repeat_rate = round((phone_counts[phone_counts > 1].sum() / phone_counts.sum()) * 100, 2) if phone_counts.sum() else 0
 
@@ -164,7 +312,6 @@ uniq_clients_by_employee = (
     .sort_values(ascending=False).rename("unique_clients").reset_index()
 )
 
-# Для виводу категорій — людські назви
 cats = (
     done_df.groupby("category_name")["status"].count()
     .sort_values(ascending=False).rename("tasks").reset_index()
@@ -191,63 +338,49 @@ sb_df = done_df[done_df["category_code"] == "SEC"]
 sb_unique_clients = int(sb_df["phone"].nunique(dropna=True))
 
 # =========================
-# === НОВЕ: повторні звернення по співробітниках (клієнти з ≥2 зверненнями за день)
+# === НОВЕ: повторні звернення по співробітниках
 # =========================
 THRESHOLD_REPEAT = 30  # поріг, %
 
-# таблиця "employee, phone, events"
 emp_phone = (
     done_df.groupby(["employee", "phone"])["status"]
     .count()
     .rename("events")
     .reset_index()
 )
-
-# скільки у співробітника було унікальних клієнтів і скільки з них зверталися 2+ рази
 tot_clients = emp_phone.groupby("employee")["phone"].nunique().rename("total_clients")
 rep_clients = (
     emp_phone[emp_phone["events"] >= 2]
     .groupby("employee")["phone"].nunique()
     .rename("repeat_clients")
 )
-
 repeat_by_employee = (
     pd.concat([tot_clients, rep_clients], axis=1)
     .fillna(0)
     .reset_index()
 )
-
-# частка повторних клієнтів у % (округлено до 2 знаків)
 repeat_by_employee["repeat_share_pct"] = (
     (repeat_by_employee["repeat_clients"] / repeat_by_employee["total_clients"].replace({0: np.nan})) * 100
 ).fillna(0).round(2)
 
-# для зручності — зведемо в один датафрейм разом із задачами/унік. клієнтами
 emp_summary = (
     tasks_by_employee
     .merge(uniq_clients_by_employee, on="employee", how="outer")
     .merge(repeat_by_employee, on="employee", how="outer")
     .fillna(0)
 )
-
-# Відсортуємо за часткою повторних (спадно), щоб звертати увагу на «ризикових»
 emp_summary = emp_summary.sort_values(["repeat_share_pct", "tasks_done"], ascending=[False, False]).reset_index(drop=True)
 
 # =========================
 # ЛІНІЙНИЙ ГРАФІК АКТИВНОСТІ (вчора, Київ)
 # =========================
-# Сітка годин 00..23 (Київ)
 hidx = pd.date_range(start=start_date, end=end_date_exclusive - timedelta(hours=1), freq="H", tz=KYIV_TZ)
-
-# Надійний підрахунок: беремо всі події дня, округляємо до початку години
 hour_floor = day_df["dt_kyiv"].dt.tz_convert(KYIV_TZ).dt.floor("H")
 events_by_hour = (
     hour_floor.value_counts()
     .reindex(hidx, fill_value=0)
     .sort_index()
 )
-
-# Fallback на випадок дивних TZ-різниць: рахуємо по номеру години 0..23
 if events_by_hour.values.sum() == 0 and len(day_df) > 0:
     by_hour_int = (day_df["dt_kyiv"].dt.hour.value_counts().reindex(range(24), fill_value=0))
     hour_labels = [f"{h:02d}:00" for h in range(24)]
@@ -256,9 +389,8 @@ else:
     hour_labels = [d.strftime("%H:%M") for d in hidx]
     events_values = events_by_hour.values
 
-# Для підписів піків/мінімумів
-peak_idx = np.argsort(-events_values)[:3]                   # топ-3 години
-valley_idx = np.argsort(events_values)[:1]                  # мінімум (одна година)
+peak_idx = np.argsort(-events_values)[:3]
+valley_idx = np.argsort(events_values)[:1]
 
 # =========================
 # Дашборд
@@ -269,7 +401,6 @@ fig = plt.figure(figsize=(16, 9))
 gs = fig.add_gridspec(2, 2, height_ratios=[1.4, 1.0], hspace=0.4, wspace=0.25)
 fig.suptitle(f"Підтримка • Денний звіт {start_date.strftime('%d.%m.%Y')} (час Києва)", fontsize=18, fontweight="bold")
 
-# Верх: лінія активності
 ax0 = fig.add_subplot(gs[0, :])
 ax0.plot(hour_labels, events_values, marker="o")
 ax0.set_title("Звернення по годинах (усі події, час Києва)")
@@ -278,8 +409,6 @@ ax0.set_ylabel("К-сть звернень")
 ax0.set_xticks(range(0, len(hour_labels), max(1, len(hour_labels)//8)))
 ax0.tick_params(axis='x', rotation=45)
 ax0.set_ylim(bottom=0, top=max(1, int(max(events_values) * 1.2)))
-
-# позначимо піки/мінімум
 for i in peak_idx:
     ax0.annotate(f"пік: {events_values[i]}", (i, events_values[i]),
                  textcoords="offset points", xytext=(0, 8), ha="center", fontsize=9)
@@ -287,7 +416,6 @@ for i in valley_idx:
     ax0.annotate(f"мін: {events_values[i]}", (i, events_values[i]),
                  textcoords="offset points", xytext=(0, -12), ha="center", fontsize=9)
 
-# Низ ліворуч: унікальні клієнти по співробітнику
 ax1 = fig.add_subplot(gs[1, 0])
 x1 = np.arange(len(emp_summary))
 ax1.bar(x1, emp_summary["unique_clients"])
@@ -298,7 +426,6 @@ ax1.set_ylabel("К-сть унікальних телефонів")
 for i, v in enumerate(emp_summary["unique_clients"]):
     ax1.text(i, v + 0.05, str(int(v)), ha='center', va='bottom')
 
-# Низ праворуч: розподіл задач за категоріями (людські назви)
 ax2 = fig.add_subplot(gs[1, 1])
 x2 = np.arange(len(cats))
 ax2.bar(x2, cats["tasks"])
@@ -315,7 +442,7 @@ fig.savefig(dashboard_img, dpi=200, bbox_inches="tight")
 plt.close(fig)
 
 # =========================
-# Текст звіту
+# Текст звіту підтримки
 # =========================
 max_tasks = tasks_by_employee["tasks_done"].max() if len(tasks_by_employee) else 0
 min_tasks = tasks_by_employee["tasks_done"].min() if len(tasks_by_employee) else 0
@@ -328,10 +455,8 @@ def badge_tasks(tasks):
         b.append("🔴")
     return " ".join(b)
 
-# мапа співробітник -> к-сть унікальних клієнтів
 u_map = dict(zip(emp_summary["employee"], emp_summary["unique_clients"]))
 
-# рядки по співробітниках: задачі + унік. клієнти
 emp_lines = []
 for _, r in emp_summary.iterrows():
     emp = r["employee"]
@@ -340,7 +465,6 @@ for _, r in emp_summary.iterrows():
     emp_lines.append(f"• <b>{emp}</b> — задач: <b>{t}</b> {badge_tasks(t)} | унікальних клієнтів: <b>{u}</b>")
 employees_inline_text = "\n".join(emp_lines)
 
-# === НОВЕ: блок «Повторні звернення по співробітниках» з порогом 30%
 rep_lines = []
 for _, r in emp_summary.iterrows():
     emp = r["employee"]
@@ -348,11 +472,7 @@ for _, r in emp_summary.iterrows():
     repeat_c = int(r.get("repeat_clients", 0))
     share = float(r.get("repeat_share_pct", 0.0))
     flag = "🔴" if share > THRESHOLD_REPEAT else "🟢"
-    # якщо за день не було клієнтів — покажемо 0%
-    rep_lines.append(
-        f"• <b>{emp}</b> — повторні клієнти: <b>{share}%</b> "
-        f"({repeat_c} з {total_c}) {flag}"
-    )
+    rep_lines.append(f"• <b>{emp}</b> — повторні клієнти: <b>{share}%</b> ({repeat_c} з {total_c}) {flag}")
 repeat_inline_text = "\n".join(rep_lines)
 
 cat_lines = [f"• <b>{row['category_name']}</b>: {int(row['tasks'])}" for _, row in cats.iterrows()]
@@ -380,7 +500,13 @@ kpi_text = (
 )
 
 # =========================
-# Відправка
+# Відправка: 1) звіт підтримки
 # =========================
 send_photo(dashboard_img, CHAT_IDS)
 send_message(kpi_text, CHAT_IDS)
+
+# =========================
+# Відправка: 2) окремий блок "Дні народження"
+# =========================
+birthday_text = format_birthday_message()
+send_message(birthday_text, BIRTHDAYS_CHAT_IDS)
