@@ -389,23 +389,33 @@ def build_stages_cache() -> Dict[str, str]:
         print(f"⚠ Failed to load stages cache: {e}")
         return {}
 
-def format_birthday_message() -> str:
-    """Форматирование сообщения о днях рождения с разделением на своих и потенциальных клиентов."""
+def format_birthday_messages() -> Dict[str, str]:
+    """Форматирование сообщений о днях рождения.
+
+    Возвращает словарь с двумя ключами:
+    - "main": основное сообщение (сотрудники + все клиенты)
+    - "potential_only": только потенциальные клиенты для отдельной отправки
+    """
     employees = b24_get_employees_birthday_today()
     clients = b24_get_clients_birthday_today()
 
     if not employees and not clients:
-        return "📅 На сьогодні днів народження немає."
+        return {
+            "main": "📅 На сьогодні днів народження немає.",
+            "potential_only": ""
+        }
 
-    lines = ["🎂 Щоденна перевірка днів народження:"]
+    lines_main = ["🎂 Щоденна перевірка днів народження:"]
+    lines_potential = []
 
     # Сотрудники
     if employees:
-        lines.append("\n👥 Співробітники:")
+        lines_main.append("\n👥 Співробітники:")
         for e in employees:
-            lines.append(f"• {e['name']}")
+            lines_main.append(f"• {e['name']}")
 
     # Клиенты
+    potential_clients = []
     if clients:
         # Получаем ID всех контактов с ДР
         contact_ids = [c["id"] for c in clients]
@@ -421,7 +431,6 @@ def format_birthday_message() -> str:
 
         # Разделяем клиентов на две категории
         our_clients = []
-        potential_clients = []
 
         for c in clients:
             contact_id = str(c["id"])
@@ -442,15 +451,15 @@ def format_birthday_message() -> str:
 
         # Форматируем НАШИХ клиентов (с расширенной информацией)
         if our_clients:
-            lines.append("\n✅ <b>Наші клієнти</b> (є сделки в цільових воронках):")
+            lines_main.append("\n✅ <b>Наші клієнти</b> (є сделки в цільових воронках):")
             for ci in our_clients:
                 c = ci["contact"]
                 phones_str = ", ".join(c["phones"]) if c["phones"] else "(тел. відсутній)"
 
-                lines.append(f"\n📋 <b>{c['name']}</b>")
-                lines.append(f"   📞 {phones_str}")
-                lines.append(f"   🆔 <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a>")
-                lines.append(f"   👨‍💼 Менеджер: {ci['contact_manager']}")
+                lines_main.append(f"\n📋 <b>{c['name']}</b>")
+                lines_main.append(f"   📞 {phones_str}")
+                lines_main.append(f"   🆔 <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a>")
+                lines_main.append(f"   👨‍💼 Менеджер: {ci['contact_manager']}")
 
                 # Информация о сделках
                 for deal_info in ci["category"]["deals_info"]:
@@ -460,14 +469,19 @@ def format_birthday_message() -> str:
                     stage_id = deal_info['stage_id']
                     stage_name = stages_cache.get(stage_id, stage_id)  # fallback на ID если не нашли
 
-                    lines.append(f"   🗂️ Воронка: <b>{deal_info['funnel_name']}</b>")
-                    lines.append(f"      • Стадія: {stage_name}")
-                    lines.append(f"      • На стадії: {deal_info['days_in_stage']} днів")
-                    lines.append(f"      • Відповідальний юрист: {lawyer}")
+                    lines_main.append(f"   🗂️ Воронка: <b>{deal_info['funnel_name']}</b>")
+                    lines_main.append(f"      • Стадія: {stage_name}")
+                    lines_main.append(f"      • На стадії: {deal_info['days_in_stage']} днів")
+                    lines_main.append(f"      • Відповідальний юрист: {lawyer}")
 
         # Форматируем ПОТЕНЦИАЛЬНЫХ клиентов (для повторной продажи)
         if potential_clients:
-            lines.append("\n🎯 <b>Потенційні клієнти</b> (немає сделок в цільових воронках — можна спробувати продати!):")
+            lines_main.append("\n🎯 <b>Потенційні клієнти</b> (немає угод в цільових воронках — можна спробувати продати!):")
+
+            # Отдельное сообщение только для потенциальных клиентов
+            lines_potential.append("🎯 <b>Потенційні клієнти з Днем народження!</b>")
+            lines_potential.append("(немає угод в цільових воронках — можна спробувати продати!)\n")
+
             for ci in potential_clients:
                 c = ci["contact"]
                 phones_str = ", ".join(c["phones"]) if c["phones"] else "(тел. відсутній)"
@@ -475,10 +489,21 @@ def format_birthday_message() -> str:
                 # Вычисляем сколько дней с создания контакта
                 days_since_create = days_since(ci["date_create"])
 
-                lines.append(f"• <b>{c['name']}</b> — {phones_str}")
-                lines.append(f"  <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a> | Створено: {days_since_create} днів тому | Менеджер: {ci['contact_manager']}")
+                # Для основного сообщения
+                lines_main.append(f"• <b>{c['name']}</b> — {phones_str}")
+                lines_main.append(f"  <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a> | Створено: {days_since_create} днів тому | Менеджер: {ci['contact_manager']}")
 
-    return "\n".join(lines)
+                # Для отдельного сообщения
+                lines_potential.append(f"📋 <b>{c['name']}</b>")
+                lines_potential.append(f"   📞 {phones_str}")
+                lines_potential.append(f"   🆔 <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a>")
+                lines_potential.append(f"   👨‍💼 Менеджер: {ci['contact_manager']}")
+                lines_potential.append(f"   📅 Створено: {days_since_create} днів тому\n")
+
+    return {
+        "main": "\n".join(lines_main),
+        "potential_only": "\n".join(lines_potential) if lines_potential else ""
+    }
 
 # =========================
 # Завантаження даних підтримки
@@ -746,5 +771,11 @@ send_message(kpi_text, CHAT_IDS)
 # =========================
 # Відправка: 2) окремий блок "Дні народження"
 # =========================
-birthday_text = format_birthday_message()
-send_message(birthday_text, BIRTHDAYS_CHAT_IDS)
+birthday_messages = format_birthday_messages()
+
+# Основное сообщение (для всех чатов из BIRTHDAYS_CHAT_IDS)
+send_message(birthday_messages["main"], BIRTHDAYS_CHAT_IDS)
+
+# Отдельное сообщение с потенциальными клиентами на специальный ID
+if birthday_messages["potential_only"]:
+    send_message(birthday_messages["potential_only"], [6775209607])
