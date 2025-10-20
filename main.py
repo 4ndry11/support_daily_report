@@ -42,6 +42,8 @@ CHAT_IDS = [int(x) for x in os.getenv("CHAT_IDS", "727013047,6555660815,71888545
 # === Новое: Bitrix для дней рождения ===
 BITRIX_CONTACT_URL = os.getenv("BITRIX_CONTACT_URL")  # .../crm.contact.list.json
 BITRIX_USERS_URL   = os.getenv("BITRIX_USERS_URL")    # .../user.get.json
+BITRIX_DEALS_URL   = os.getenv("BITRIX_DEALS_URL")    # .../crm.deal.list.json
+BITRIX_STAGES_URL  = os.getenv("BITRIX_STAGES_URL")   # .../crm.status.list.json (опционально, для названий стадий)
 
 # === Новое: отдельные чаты для ДР (опционально). Если не указано — используем CHAT_IDS.
 BIRTHDAYS_CHAT_IDS = [int(x) for x in os.getenv("BIRTHDAYS_CHAT_IDS", "").split(",") if x.strip()]
@@ -199,14 +201,20 @@ def b24_get_clients_birthday_today() -> List[Dict[str, Any]]:
     month_today, day_today = today_month_day()
     items = b24_paged_get(
         BITRIX_CONTACT_URL,
-        {"filter[!BIRTHDATE]": "", "select[]": ["ID", "NAME", "LAST_NAME", "BIRTHDATE", "PHONE"]}
+        {"filter[!BIRTHDATE]": "", "select[]": ["ID", "NAME", "SECOND_NAME", "LAST_NAME", "BIRTHDATE", "PHONE", "DATE_CREATE", "ASSIGNED_BY_ID"]}
     )
     result = []
     for c in items or []:
         md = parse_b24_date(c.get("BIRTHDATE"))
         if not md or md != (month_today, day_today):
             continue
-        full_name = f"{(c.get('NAME') or '').strip()} {(c.get('LAST_NAME') or '').strip()}".strip() or "Без імені"
+        # Полное ФИО: Фамилия Имя Отчество
+        name_parts = [
+            (c.get('LAST_NAME') or '').strip(),
+            (c.get('NAME') or '').strip(),
+            (c.get('SECOND_NAME') or '').strip()
+        ]
+        full_name = " ".join([p for p in name_parts if p]) or "Без імені"
         phones = []
         for ph in c.get("PHONE", []) or []:
             val = normalize_phone(ph.get("VALUE", ""))
@@ -219,27 +227,253 @@ def b24_get_clients_birthday_today() -> List[Dict[str, Any]]:
             if k not in seen:
                 seen.add(k)
                 uniq.append(p)
-        result.append({"id": c.get("ID"), "name": full_name, "phones": uniq})
+        result.append({
+            "id": c.get("ID"),
+            "name": full_name,
+            "phones": uniq,
+            "date_create": c.get("DATE_CREATE", ""),
+            "assigned_by_id": c.get("ASSIGNED_BY_ID", "")
+        })
     result.sort(key=lambda x: x["name"].lower())
     return result
 
+def b24_get_deals_for_contacts(contact_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """Получить все сделки для списка контактов, сгруппированные по CONTACT_ID."""
+    if not BITRIX_DEALS_URL or not contact_ids:
+        return {}
+
+    # Битрикс не поддерживает фильтр по нескольким CONTACT_ID напрямую,
+    # поэтому получаем все сделки и фильтруем на клиенте
+    deals = b24_paged_get(
+        BITRIX_DEALS_URL,
+        {"select[]": ["ID", "TITLE", "CATEGORY_ID", "STAGE_ID", "STAGE_SEMANTIC_ID",
+                      "DATE_CREATE", "DATE_MODIFY", "ASSIGNED_BY_ID", "CONTACT_ID"]}
+    )
+
+    # Группируем сделки по CONTACT_ID
+    contact_deals: Dict[str, List[Dict[str, Any]]] = {}
+    contact_id_set = set(str(cid) for cid in contact_ids)
+
+    for deal in deals or []:
+        # В Битрикс24 CONTACT_ID может быть массивом или одним значением
+        contact_id = deal.get("CONTACT_ID")
+        if isinstance(contact_id, list):
+            deal_contacts = [str(c) for c in contact_id if c]
+        else:
+            deal_contacts = [str(contact_id)] if contact_id else []
+
+        for cid in deal_contacts:
+            if cid in contact_id_set:
+                if cid not in contact_deals:
+                    contact_deals[cid] = []
+                contact_deals[cid].append(deal)
+
+    return contact_deals
+
+def parse_b24_datetime(dt_str: str):
+    """Парсинг даты Bitrix24 формата 'YYYY-MM-DDTHH:MM:SS+03:00'."""
+    if not dt_str:
+        return None
+    try:
+        # Пробуем разные форматы
+        for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
+            try:
+                return datetime.strptime(dt_str[:19], fmt.replace("%z", ""))
+            except:
+                continue
+        return None
+    except Exception:
+        return None
+
+def days_since(dt_str: str) -> int:
+    """Сколько дней прошло с даты."""
+    dt = parse_b24_datetime(dt_str)
+    if not dt:
+        return 0
+    delta = now_kyiv().replace(tzinfo=None) - dt
+    return max(0, delta.days)
+
+def categorize_client_by_deals(deals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Категоризация клиента по сделкам.
+
+    Воронки:
+    - 7: Досудебка
+    - 1: Початок шлях до суду
+    - 2: Суд
+
+    Возвращает:
+    {
+        "is_our_client": bool,  # есть ли сделка в целевых воронках
+        "deals_info": list,      # информация о сделках в целевых воронках
+        "funnel_names": dict     # маппинг ID воронки -> название
+    }
+    """
+    TARGET_FUNNELS = {"7": "Досудебка", "1": "Початок шлях до суду", "2": "Суд"}
+
+    our_deals = []
+    for deal in deals:
+        category_id = str(deal.get("CATEGORY_ID", ""))
+        if category_id in TARGET_FUNNELS:
+            stage_id = deal.get("STAGE_ID", "Невідомо")
+            date_modify = deal.get("DATE_MODIFY", "")
+            days_in_stage = days_since(date_modify)
+
+            our_deals.append({
+                "funnel_id": category_id,
+                "funnel_name": TARGET_FUNNELS[category_id],
+                "stage_id": stage_id,
+                "days_in_stage": days_in_stage,
+                "assigned_by_id": deal.get("ASSIGNED_BY_ID", "")
+            })
+
+    return {
+        "is_our_client": len(our_deals) > 0,
+        "deals_info": our_deals,
+        "funnel_names": TARGET_FUNNELS
+    }
+
+def get_user_name_by_id(user_id: str, users_cache: Dict[str, str]) -> str:
+    """Получить имя пользователя по ID из кеша."""
+    return users_cache.get(str(user_id), f"ID:{user_id}")
+
+def build_users_cache() -> Dict[str, str]:
+    """Построить кеш ID пользователя -> Имя."""
+    if not BITRIX_USERS_URL:
+        return {}
+
+    users = b24_paged_get(
+        BITRIX_USERS_URL,
+        {"SELECT[]": ["ID", "NAME", "LAST_NAME"]}
+    )
+
+    cache = {}
+    for u in users or []:
+        uid = str(u.get("ID", ""))
+        name = f"{(u.get('NAME') or '').strip()} {(u.get('LAST_NAME') or '').strip()}".strip()
+        if uid and name:
+            cache[uid] = name
+
+    return cache
+
+def build_stages_cache() -> Dict[str, str]:
+    """Построить кеш STAGE_ID -> Название стадии.
+
+    В Bitrix24 стадии хранятся в crm.status.list с ENTITY_ID вида:
+    - DEAL_STAGE - общие стадии
+    - DEAL_STAGE_1, DEAL_STAGE_2, DEAL_STAGE_7 - стадии для конкретных воронок
+    """
+    if not BITRIX_STAGES_URL:
+        print("⚠ BITRIX_STAGES_URL not set; stage names will show as IDs")
+        return {}
+
+    try:
+        # Получаем все статусы для сделок
+        statuses = b24_paged_get(
+            BITRIX_STAGES_URL,
+            {"filter[ENTITY_ID]": "DEAL_STAGE%"}  # фильтр по маске для всех воронок
+        )
+
+        cache = {}
+        for status in statuses or []:
+            status_id = status.get("STATUS_ID", "")
+            name = status.get("NAME", "")
+            if status_id and name:
+                cache[str(status_id)] = name
+
+        return cache
+    except Exception as e:
+        print(f"⚠ Failed to load stages cache: {e}")
+        return {}
+
 def format_birthday_message() -> str:
+    """Форматирование сообщения о днях рождения с разделением на своих и потенциальных клиентов."""
     employees = b24_get_employees_birthday_today()
     clients = b24_get_clients_birthday_today()
+
     if not employees and not clients:
         return "📅 На сьогодні днів народження немає."
+
     lines = ["🎂 Щоденна перевірка днів народження:"]
+
+    # Сотрудники
     if employees:
         lines.append("\n👥 Співробітники:")
         for e in employees:
             lines.append(f"• {e['name']}")
+
+    # Клиенты
     if clients:
-        lines.append("\n🧑‍💼 Клієнти:")
+        # Получаем ID всех контактов с ДР
+        contact_ids = [c["id"] for c in clients]
+
+        # Получаем сделки для этих контактов
+        contact_deals = b24_get_deals_for_contacts(contact_ids)
+
+        # Кеш пользователей для отображения имен ответственных
+        users_cache = build_users_cache()
+
+        # Кеш стадий для отображения названий стадий
+        stages_cache = build_stages_cache()
+
+        # Разделяем клиентов на две категории
+        our_clients = []
+        potential_clients = []
+
         for c in clients:
-            if c["phones"]:
-                lines.append(f"• {c['name']} — {', '.join(c['phones'])}")
+            contact_id = str(c["id"])
+            deals = contact_deals.get(contact_id, [])
+            category = categorize_client_by_deals(deals)
+
+            client_info = {
+                "contact": c,
+                "category": category,
+                "contact_manager": get_user_name_by_id(c.get("assigned_by_id", ""), users_cache),
+                "date_create": c.get("date_create", "")
+            }
+
+            if category["is_our_client"]:
+                our_clients.append(client_info)
             else:
-                lines.append(f"• {c['name']} — (тел. відсутній)")
+                potential_clients.append(client_info)
+
+        # Форматируем НАШИХ клиентов (с расширенной информацией)
+        if our_clients:
+            lines.append("\n✅ <b>Наші клієнти</b> (є сделки в цільових воронках):")
+            for ci in our_clients:
+                c = ci["contact"]
+                phones_str = ", ".join(c["phones"]) if c["phones"] else "(тел. відсутній)"
+
+                lines.append(f"\n📋 <b>{c['name']}</b>")
+                lines.append(f"   📞 {phones_str}")
+                lines.append(f"   🆔 <a href='https://your-bitrix-domain.bitrix24.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a>")
+                lines.append(f"   👨‍💼 Менеджер: {ci['contact_manager']}")
+
+                # Информация о сделках
+                for deal_info in ci["category"]["deals_info"]:
+                    lawyer = get_user_name_by_id(deal_info["assigned_by_id"], users_cache)
+
+                    # Получаем человекочитаемое название стадии
+                    stage_id = deal_info['stage_id']
+                    stage_name = stages_cache.get(stage_id, stage_id)  # fallback на ID если не нашли
+
+                    lines.append(f"   🗂️ Воронка: <b>{deal_info['funnel_name']}</b>")
+                    lines.append(f"      • Стадія: {stage_name}")
+                    lines.append(f"      • На стадії: {deal_info['days_in_stage']} днів")
+                    lines.append(f"      • Відповідальний юрист: {lawyer}")
+
+        # Форматируем ПОТЕНЦИАЛЬНЫХ клиентов (для повторной продажи)
+        if potential_clients:
+            lines.append("\n🎯 <b>Потенційні клієнти</b> (немає сделок в цільових воронках — можна спробувати продати!):")
+            for ci in potential_clients:
+                c = ci["contact"]
+                phones_str = ", ".join(c["phones"]) if c["phones"] else "(тел. відсутній)"
+
+                # Вычисляем сколько дней с создания контакта
+                days_since_create = days_since(ci["date_create"])
+
+                lines.append(f"• <b>{c['name']}</b> — {phones_str}")
+                lines.append(f"  <a href='https://your-bitrix-domain.bitrix24.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a> | Створено: {days_since_create} днів тому | Менеджер: {ci['contact_manager']}")
+
     return "\n".join(lines)
 
 # =========================
