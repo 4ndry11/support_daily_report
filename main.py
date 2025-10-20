@@ -367,19 +367,23 @@ def build_stages_cache() -> Dict[str, str]:
         return {}
 
     try:
-        # Получаем все статусы для сделок
+        # Получаем ВСЕ статусы (Bitrix не поддерживает фильтр с маской %)
         statuses = b24_paged_get(
             BITRIX_STAGES_URL,
-            {"filter[ENTITY_ID]": "DEAL_STAGE%"}  # фильтр по маске для всех воронок
+            {}  # без фильтра - получаем все
         )
 
         cache = {}
         for status in statuses or []:
-            status_id = status.get("STATUS_ID", "")
-            name = status.get("NAME", "")
-            if status_id and name:
-                cache[str(status_id)] = name
+            entity_id = status.get("ENTITY_ID", "")
+            # Фильтруем только стадии сделок (DEAL_STAGE*)
+            if entity_id.startswith("DEAL_STAGE"):
+                status_id = status.get("STATUS_ID", "")
+                name = status.get("NAME", "")
+                if status_id and name:
+                    cache[str(status_id)] = name
 
+        print(f"✅ Loaded {len(cache)} deal stages")
         return cache
     except Exception as e:
         print(f"⚠ Failed to load stages cache: {e}")
@@ -445,7 +449,7 @@ def format_birthday_message() -> str:
 
                 lines.append(f"\n📋 <b>{c['name']}</b>")
                 lines.append(f"   📞 {phones_str}")
-                lines.append(f"   🆔 <a href='https://your-bitrix-domain.bitrix24.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a>")
+                lines.append(f"   🆔 <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a>")
                 lines.append(f"   👨‍💼 Менеджер: {ci['contact_manager']}")
 
                 # Информация о сделках
@@ -472,7 +476,7 @@ def format_birthday_message() -> str:
                 days_since_create = days_since(ci["date_create"])
 
                 lines.append(f"• <b>{c['name']}</b> — {phones_str}")
-                lines.append(f"  <a href='https://your-bitrix-domain.bitrix24.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a> | Створено: {days_since_create} днів тому | Менеджер: {ci['contact_manager']}")
+                lines.append(f"  <a href='https://ua.zvilnymo.com.ua/crm/contact/details/{c['id']}/'>Контакт #{c['id']}</a> | Створено: {days_since_create} днів тому | Менеджер: {ci['contact_manager']}")
 
     return "\n".join(lines)
 
